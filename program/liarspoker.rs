@@ -1,0 +1,645 @@
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Invalid number of players. Must be between 2 and 6.")]
+    InvalidPlayerCount,
+    #[msg("Bid amount must be greater than zero.")]
+    InvalidBidAmount,
+    #[msg("Room is not in a state where it can be joined.")]
+    RoomNotJoinable,
+    #[msg("Room is full.")]
+    RoomFull,
+    #[msg("Invalid game state for this action.")]
+    InvalidGameState,
+    #[msg("Not authorized to perform this action.")]
+    NotAuthorized,
+    #[msg("Not enough players to start the game.")]
+    NotEnoughPlayers,
+    #[msg("It's not your turn.")]
+    NotYourTurn,
+    #[msg("Invalid digit. Must be between 0 and 9.")]
+    InvalidDigit,
+    #[msg("Invalid quantity. Must be greater than zero.")]
+    InvalidQuantity,
+    #[msg("Bid amount is too low.")]
+    BidTooLow,
+    #[msg("Invalid bid. Must increase either quantity, digit value, or bid amount.")]
+    InvalidBid,
+    #[msg("No bid to challenge.")]
+    NoBidToChallenge,
+    #[msg("Player has already revealed.")]
+    AlreadyRevealed,
+    #[msg("Arithmetic error.")]
+    ArithmeticError,
+}
+use anchor_lang::prelude::*;
+
+declare_id!("GWSbHE5CXen71GH6YH7oStxQmguZaaiNWoT6g1VGgzHe");
+
+#[program]
+pub mod liars_poker {
+    use super::*;
+
+    /// Creates a new game room for Liar's Poker
+    pub fn create_room(
+        ctx: Context<CreateRoom>,
+        min_bid: u64,
+        required_players: u8,
+        room_index: u8,
+    ) -> Result<()> {
+        let room = &mut ctx.accounts.room;
+        let creator = &ctx.accounts.creator;
+
+        // Validate parameters
+        require!(
+            required_players >= 2 && required_players <= 6,
+            ErrorCode::InvalidPlayerCount
+        );
+        require!(min_bid > 0, ErrorCode::InvalidBidAmount);
+
+        // Initialize the room
+        room.creator = creator.key();
+        room.current_state = GameState::Created;
+        room.min_bid = min_bid;
+        room.required_players = required_players;
+        room.created_at = Clock::get()?.unix_timestamp;
+        room.room_id = gen_room_id(creator.key(), Clock::get()?.unix_timestamp);
+        room.bump = ctx.bumps.room;
+        room.current_bid = None;
+        room.last_bidder = None;
+        room.current_turn = None;
+        room.winner = None;
+        room.prize_pool = 0;
+        room.player_count = 0;
+        room.room_index = room_index;
+
+        emit!(RoomCreated {
+            room_id: room.room_id,
+            creator: creator.key(),
+            timestamp: room.created_at,
+            min_bid,
+            required_players,
+        });
+
+        Ok(())
+    }
+
+    /// Join an existing game room
+    pub fn join_room(ctx: Context<JoinRoom>) -> Result<()> {
+        let room = &mut ctx.accounts.room;
+        let player = &ctx.accounts.player;
+        let player_account = &mut ctx.accounts.player_account;
+
+        // Validate room state
+        require!(
+            room.current_state == GameState::Created || room.current_state == GameState::Waiting,
+            ErrorCode::RoomNotJoinable
+        );
+
+        // Check room capacity
+        require!(room.player_count < 6, ErrorCode::RoomFull);
+
+        // Initialize player account
+        player_account.player = player.key();
+        player_account.room = room.key();
+        player_account.joined_at = Clock::get()?.unix_timestamp;
+        player_account.total_bet_amount = 0;
+        player_account.has_revealed = false;
+        player_account.is_active = true;
+        player_account.bump = ctx.bumps.player_account;
+
+        // Generate a random 5-digit number for the player
+        let clock = Clock::get()?;
+        let seed = (clock.unix_timestamp as u64).wrapping_add(player.key().to_bytes()[0] as u64);
+        player_account.serial_number = generate_serial_number(seed);
+
+        // Update room
+        room.player_count += 1;
+
+        // Update game state if enough players have joined
+        if room.player_count >= room.required_players && room.current_state == GameState::Created {
+            room.current_state = GameState::Waiting;
+        }
+
+        emit!(PlayerJoined {
+            room_id: room.room_id,
+            player: player.key(),
+            serial_number: player_account.serial_number,
+        });
+
+        Ok(())
+    }
+
+    /// Start the game once enough players have joined
+    pub fn start_game(ctx: Context<StartGame>) -> Result<()> {
+        let room = &mut ctx.accounts.room;
+        let player = &ctx.accounts.player;
+
+        // Validate room state and creator
+        require!(
+            room.current_state == GameState::Waiting,
+            ErrorCode::InvalidGameState
+        );
+        require!(room.creator == player.key(), ErrorCode::NotAuthorized);
+        require!(
+            room.player_count >= room.required_players,
+            ErrorCode::NotEnoughPlayers
+        );
+
+        // Set game state to in progress
+        room.current_state = GameState::InProgress;
+
+        // Get the first player's account to set the first turn
+        // In a real implementation, you would need a more robust way to determine turn order
+        // For simplicity, we'll set it to the creator for now
+        room.current_turn = Some(player.key());
+
+        emit!(GameStarted {
+            room_id: room.room_id,
+            start_timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
+
+    /// Place a bid during the game
+    pub fn place_bid(
+        ctx: Context<PlaceBid>,
+        digit: u8,
+        quantity: u8,
+        bid_amount: u64,
+    ) -> Result<()> {
+        let room = &mut ctx.accounts.room;
+        let player = &ctx.accounts.player;
+        let player_account = &mut ctx.accounts.player_account;
+
+        // Validate game state
+        require!(
+            room.current_state == GameState::InProgress,
+            ErrorCode::InvalidGameState
+        );
+        require!(
+            room.current_turn.is_some() && room.current_turn.unwrap() == player.key(),
+            ErrorCode::NotYourTurn
+        );
+        require!(digit <= 9, ErrorCode::InvalidDigit);
+        require!(quantity > 0, ErrorCode::InvalidQuantity);
+        require!(bid_amount >= room.min_bid, ErrorCode::BidTooLow);
+
+        // If there's a current bid, validate the new bid is higher
+        if let Some(current_bid) = &room.current_bid {
+            require!(
+                quantity > current_bid.quantity
+                    || (quantity == current_bid.quantity && digit > current_bid.digit)
+                    || bid_amount > current_bid.bid_amount,
+                ErrorCode::InvalidBid
+            );
+        }
+
+        // Update the player's bet amount
+        player_account.total_bet_amount = player_account
+            .total_bet_amount
+            .checked_add(bid_amount)
+            .ok_or(ErrorCode::ArithmeticError)?;
+
+        // Update the room's prize pool
+        room.prize_pool = room
+            .prize_pool
+            .checked_add(bid_amount)
+            .ok_or(ErrorCode::ArithmeticError)?;
+
+        // Update the current bid
+        room.current_bid = Some(Bid {
+            bidder: player.key(),
+            digit,
+            quantity,
+            bid_amount,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        room.last_bidder = Some(player.key());
+
+        // Update the turn (simplified - would need to iterate through player accounts in a full implementation)
+        // For now, we'll just keep the same player's turn
+        // In a real implementation, you would fetch all player accounts and set the next one
+
+        emit!(BidPlaced {
+            room_id: room.room_id,
+            bidder: player.key(),
+            digit,
+            quantity,
+            bid_amount,
+        });
+
+        Ok(())
+    }
+
+    /// Challenge the previous bid (call liar)
+    pub fn challenge(ctx: Context<Challenge>) -> Result<()> {
+        let room = &mut ctx.accounts.room;
+        let player = &ctx.accounts.player;
+
+        // Validate game state
+        require!(
+            room.current_state == GameState::InProgress,
+            ErrorCode::InvalidGameState
+        );
+        require!(
+            room.current_turn.is_some() && room.current_turn.unwrap() == player.key(),
+            ErrorCode::NotYourTurn
+        );
+        require!(room.last_bidder.is_some(), ErrorCode::NoBidToChallenge);
+
+        // Set game to revealing state
+        room.current_state = GameState::Revealing;
+
+        emit!(LiarCalled {
+            room_id: room.room_id,
+            caller: player.key(),
+            last_bidder: room.last_bidder.unwrap(),
+        });
+
+        Ok(())
+    }
+
+    /// Reveal a player's number and resolve the game if all players have revealed
+    pub fn reveal(ctx: Context<Reveal>) -> Result<()> {
+        let room = &mut ctx.accounts.room;
+        let player = &ctx.accounts.player;
+        let player_account = &mut ctx.accounts.player_account;
+
+        // Validate game state
+        require!(
+            room.current_state == GameState::Revealing,
+            ErrorCode::InvalidGameState
+        );
+        require!(!player_account.has_revealed, ErrorCode::AlreadyRevealed);
+
+        // Mark player as revealed
+        player_account.has_revealed = true;
+
+        // Check if all players have revealed and determine winner
+        // In a real implementation, you would iterate through all player accounts
+        // For now, we'll just set the game as complete and the winner as the challenger
+        // (this is a simplification - would need proper logic in a real implementation)
+        room.current_state = GameState::Completed;
+        room.winner = Some(player.key());
+
+        emit!(GameEnded {
+            room_id: room.room_id,
+            winner: room.winner.unwrap(),
+            prize_pool: room.prize_pool,
+        });
+
+        Ok(())
+    }
+
+    pub fn get_room_details(ctx: Context<GetRoomDetails>) -> Result<RoomDetails> {
+        let room = &ctx.accounts.room;
+        
+        Ok(RoomDetails {
+            room_id: room.room_id,
+            creator: room.creator,
+            current_state: room.current_state,
+            created_at: room.created_at,
+            min_bid: room.min_bid,
+            required_players: room.required_players,
+            player_count: room.player_count,
+            current_bid: room.current_bid,
+            prize_pool: room.prize_pool,
+        })
+    }
+
+    pub fn list_creator_rooms(ctx: Context<ListCreatorRooms>) -> Result<Vec<RoomDetails>> {
+        // This would require additional storage to track creator's rooms
+        // You might want to create a new account type to store this information
+        Ok(Vec::new())
+    }
+
+    pub fn cancel_room(ctx: Context<CancelRoom>) -> Result<()> {
+        let room = &mut ctx.accounts.room;
+        
+        require!(
+            room.current_state != GameState::InProgress,
+            ErrorCode::InvalidGameState
+        );
+
+        room.current_state = GameState::Canceled;
+
+        emit!(RoomCanceled {
+            room_id: room.room_id,
+            creator: room.creator,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
+
+    pub fn get_player_details(ctx: Context<GetPlayerDetails>) -> Result<PlayerDetails> {
+        let player_account = &ctx.accounts.player_account;
+        
+        Ok(PlayerDetails {
+            player: player_account.player,
+            room: player_account.room,
+            joined_at: player_account.joined_at,
+            total_bet_amount: player_account.total_bet_amount,
+            is_active: player_account.is_active,
+        })
+    }
+}
+
+#[account]
+pub struct Room {
+    pub room_id: u64,
+    pub creator: Pubkey,
+    pub current_state: GameState,
+    pub created_at: i64,
+    pub min_bid: u64,
+    pub required_players: u8,
+    pub player_count: u8,
+    pub current_bid: Option<Bid>,
+    pub last_bidder: Option<Pubkey>,
+    pub current_turn: Option<Pubkey>,
+    pub winner: Option<Pubkey>,
+    pub prize_pool: u64,
+    pub bump: u8,
+    pub room_index: u8,
+}
+
+#[account]
+pub struct PlayerAccount {
+    pub player: Pubkey,
+    pub room: Pubkey,
+    pub serial_number: u32,
+    pub joined_at: i64,
+    pub total_bet_amount: u64,
+    pub has_revealed: bool,
+    pub is_active: bool,
+    pub bump: u8,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+pub enum GameState {
+    Created,
+    Waiting,
+    InProgress,
+    Revealing,
+    Completed,
+    Canceled,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct Bid {
+    pub bidder: Pubkey,
+    pub digit: u8,
+    pub quantity: u8,
+    pub bid_amount: u64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct RoomCreated {
+    pub room_id: u64,
+    pub creator: Pubkey,
+    pub timestamp: i64,
+    pub min_bid: u64,
+    pub required_players: u8,
+}
+
+#[event]
+pub struct PlayerJoined {
+    pub room_id: u64,
+    pub player: Pubkey,
+    pub serial_number: u32,
+}
+
+#[event]
+pub struct GameStarted {
+    pub room_id: u64,
+    pub start_timestamp: i64,
+}
+
+#[event]
+pub struct BidPlaced {
+    pub room_id: u64,
+    pub bidder: Pubkey,
+    pub digit: u8,
+    pub quantity: u8,
+    pub bid_amount: u64,
+}
+
+#[event]
+pub struct LiarCalled {
+    pub room_id: u64,
+    pub caller: Pubkey,
+    pub last_bidder: Pubkey,
+}
+
+#[event]
+pub struct GameEnded {
+    pub room_id: u64,
+    pub winner: Pubkey,
+    pub prize_pool: u64,
+}
+
+#[event]
+pub struct RoomCanceled {
+    pub room_id: u64,
+    pub creator: Pubkey,
+    pub timestamp: i64,
+}
+
+#[derive(Accounts)]
+pub struct CreateRoom<'info> {
+    #[account(
+        init,
+        payer = creator,
+        space = 8 + std::mem::size_of::<Room>(),
+        seeds = [b"room", creator.key().as_ref(), &[room_index]],
+        bump
+    )]
+    pub room: Account<'info, Room>,
+
+    #[account(mut)]
+    pub creator: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct JoinRoom<'info> {
+    #[account(
+        mut,
+        constraint = room.current_state == GameState::Created || room.current_state == GameState::Waiting,
+        seeds = [b"room", room.creator.as_ref()],
+        bump = room.bump,
+    )]
+    pub room: Account<'info, Room>,
+
+    #[account(
+        init,
+        payer = player,
+        space = 8 + std::mem::size_of::<PlayerAccount>(),
+        seeds = [b"player", room.key().as_ref(), player.key().as_ref()],
+        bump
+    )]
+    pub player_account: Account<'info, PlayerAccount>,
+
+    #[account(mut)]
+    pub player: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct StartGame<'info> {
+    #[account(
+        mut,
+        constraint = room.current_state == GameState::Waiting,
+        constraint = room.creator == player.key(),
+        seeds = [b"room", room.creator.as_ref()],
+        bump = room.bump,
+    )]
+    pub room: Account<'info, Room>,
+
+    #[account(mut)]
+    pub player: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct PlaceBid<'info> {
+    #[account(
+        mut,
+        constraint = room.current_state == GameState::InProgress,
+        seeds = [b"room", room.creator.as_ref()],
+        bump = room.bump,
+    )]
+    pub room: Account<'info, Room>,
+
+    #[account(
+        mut,
+        constraint = player_account.player == player.key() && player_account.room == room.key(),
+        seeds = [b"player", room.key().as_ref(), player.key().as_ref()],
+        bump = player_account.bump,
+    )]
+    pub player_account: Account<'info, PlayerAccount>,
+
+    #[account(mut)]
+    pub player: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Challenge<'info> {
+    #[account(
+        mut,
+        constraint = room.current_state == GameState::InProgress,
+        seeds = [b"room", room.creator.as_ref()],
+        bump = room.bump,
+    )]
+    pub room: Account<'info, Room>,
+
+    #[account(mut)]
+    pub player: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Reveal<'info> {
+    #[account(
+        mut,
+        constraint = room.current_state == GameState::Revealing,
+        seeds = [b"room", room.creator.as_ref()],
+        bump = room.bump,
+    )]
+    pub room: Account<'info, Room>,
+
+    #[account(
+        mut,
+        constraint = player_account.player == player.key() && player_account.room == room.key(),
+        seeds = [b"player", room.key().as_ref(), player.key().as_ref()],
+        bump = player_account.bump,
+    )]
+    pub player_account: Account<'info, PlayerAccount>,
+
+    #[account(mut)]
+    pub player: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct GetRoomDetails<'info> {
+    #[account(
+        seeds = [b"room", room.creator.as_ref()],
+        bump = room.bump,
+    )]
+    pub room: Account<'info, Room>,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct RoomDetails {
+    pub room_id: u64,
+    pub creator: Pubkey,
+    pub current_state: GameState,
+    pub created_at: i64,
+    pub min_bid: u64,
+    pub required_players: u8,
+    pub player_count: u8,
+    pub current_bid: Option<Bid>,
+    pub prize_pool: u64,
+}
+
+#[derive(Accounts)]
+pub struct ListCreatorRooms<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CancelRoom<'info> {
+    #[account(
+        mut,
+        constraint = room.creator == creator.key(),
+        constraint = room.current_state != GameState::Completed,
+        seeds = [b"room", room.creator.as_ref()],
+        bump = room.bump,
+    )]
+    pub room: Account<'info, Room>,
+
+    #[account(mut)]
+    pub creator: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct GetPlayerDetails<'info> {
+    #[account(
+        seeds = [b"player", room.key().as_ref(), player.key().as_ref()],
+        bump = player_account.bump,
+    )]
+    pub player_account: Account<'info, PlayerAccount>,
+    
+    pub room: Account<'info, Room>,
+    pub player: AccountInfo<'info>,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct PlayerDetails {
+    pub player: Pubkey,
+    pub room: Pubkey,
+    pub joined_at: i64,
+    pub total_bet_amount: u64,
+    pub is_active: bool,
+}
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+// Helper function to generate a room ID
+fn gen_room_id(creator: Pubkey, timestamp: i64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    creator.hash(&mut hasher);
+    timestamp.hash(&mut hasher);
+    hasher.finish()
+}
+
+// Helper function to generate a serial number for a player
+fn generate_serial_number(seed: u64) -> u32 {
+    // Generate a 5-digit number (10000 to 99999)
+    (seed % 90000 + 10000) as u32
+}
